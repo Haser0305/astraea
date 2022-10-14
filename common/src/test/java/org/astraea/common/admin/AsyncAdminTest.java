@@ -16,21 +16,23 @@
  */
 package org.astraea.common.admin;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.concurrent.ExecutionException;
-import java.util.function.Supplier;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import java.util.stream.IntStream;
+import java.util.stream.Stream;
 import org.astraea.common.DataRate;
 import org.astraea.common.Utils;
 import org.astraea.common.consumer.Consumer;
@@ -41,6 +43,8 @@ import org.astraea.common.producer.Serializer;
 import org.astraea.it.RequireBrokerCluster;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class AsyncAdminTest extends RequireBrokerCluster {
 
@@ -840,6 +844,258 @@ public class AsyncAdminTest extends RequireBrokerCluster {
                   .filter(q -> q.targetValue().equals(Utils.hostname()))
                   .filter(q -> q.limitKey().equals(QuotaConfigs.CONSUMER_BYTE_RATE_CONFIG))
                   .count());
+    }
+  }
+
+  @Test
+  void testClusterInfo() throws ExecutionException, InterruptedException {
+    var topic0 = Utils.randomString();
+    var topic1 = Utils.randomString();
+    var topic2 = Utils.randomString();
+    int partitionCount = 10;
+    short replicaCount = 2;
+
+    try (var admin = AsyncAdmin.of(bootstrapServers())) {
+      Stream.of(topic0, topic1, topic2)
+            .forEach(
+                topic ->
+                    Utils.packException(
+                        () ->
+                            admin
+                                .creator()
+                                .topic(topic)
+                                .numberOfPartitions(partitionCount)
+                                .numberOfReplicas(replicaCount)
+                                .run()
+                                .toCompletableFuture()
+                                .get()));
+
+      Utils.sleep(Duration.ofSeconds(2));
+
+      final var clusterInfo =
+          admin.clusterInfo(Set.of(topic0, topic1, topic2)).toCompletableFuture().get();
+
+      // ClusterInfo#nodes
+      Assertions.assertEquals(
+          brokerIds(),
+          clusterInfo.nodes().stream().map(NodeInfo::id).collect(Collectors.toUnmodifiableSet()));
+      // ClusterInfo#topics
+      Assertions.assertEquals(Set.of(topic0, topic1, topic2), clusterInfo.topics());
+      // ClusterInfo#replicas
+      Assertions.assertEquals(partitionCount * replicaCount, clusterInfo.replicas(topic0).size());
+      Assertions.assertEquals(partitionCount * replicaCount, clusterInfo.replicas(topic1).size());
+      Assertions.assertEquals(partitionCount * replicaCount, clusterInfo.replicas(topic2).size());
+      // ClusterInfo#availableReplicas
+      Assertions.assertEquals(
+          partitionCount * replicaCount, clusterInfo.availableReplicas(topic0).size());
+      Assertions.assertEquals(
+          partitionCount * replicaCount, clusterInfo.availableReplicas(topic1).size());
+      Assertions.assertEquals(
+          partitionCount * replicaCount, clusterInfo.availableReplicas(topic2).size());
+      // ClusterInfo#availableReplicaLeaders
+      Assertions.assertEquals(partitionCount, clusterInfo.replicaLeaders(topic0).size());
+      Assertions.assertEquals(partitionCount, clusterInfo.replicaLeaders(topic1).size());
+      Assertions.assertEquals(partitionCount, clusterInfo.replicaLeaders(topic2).size());
+      // No resource match found will raise exception
+      Assertions.assertEquals(List.of(), clusterInfo.replicas("Unknown Topic"));
+      Assertions.assertEquals(List.of(), clusterInfo.availableReplicas("Unknown Topic"));
+      Assertions.assertEquals(List.of(), clusterInfo.replicaLeaders("Unknown Topic"));
+      Assertions.assertThrows(NoSuchElementException.class, () -> clusterInfo.node(-1));
+
+      admin
+          .topicPartitions(Set.of(topic0, topic1, topic2))
+          .toCompletableFuture()
+          .get()
+          .forEach(
+              t ->
+                  brokerIds()
+                      .forEach(
+                          id -> Assertions.assertNotEquals(0, clusterInfo.replicas(t).size())));
+
+      admin
+          .topicPartitions(Set.of(topic0, topic1, topic2))
+          .toCompletableFuture()
+          .get()
+          .forEach(p -> Assertions.assertNotEquals(0, clusterInfo.replicas(p).size()));
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(shorts = {1, 2, 3})
+  void preferredLeaderElection(short replicaSize) throws ExecutionException, InterruptedException {
+    var clusterSize = brokerIds().size();
+    var topic = Utils.randomString();
+    try (var admin = AsyncAdmin.of(bootstrapServers())) {
+      admin
+          .creator()
+          .topic(topic)
+          .numberOfPartitions(30)
+          .numberOfReplicas(replicaSize)
+          .run()
+          .toCompletableFuture()
+          .get();
+
+      Utils.sleep(Duration.ofSeconds(3));
+
+      var topicPartitions =
+          IntStream.range(0, 30)
+                   .mapToObj(i -> TopicPartition.of(topic, i))
+                   .collect(Collectors.toUnmodifiableSet());
+
+      var currentLeaderMap =
+          (Supplier<Map<TopicPartition, Integer>>)
+              () ->
+                  Utils.packException(
+                      () ->
+                          admin.replicas(Set.of(topic)).toCompletableFuture().get().stream()
+                               .filter(Replica::isLeader)
+                               .collect(
+                                   Utils.toSortedMap(
+                                       replica ->
+                                           TopicPartition.of(replica.topic(), replica.partition()),
+                                       replica -> replica.nodeInfo().id())));
+
+      var expectedReplicaList =
+          currentLeaderMap.get().entrySet().stream()
+                          .collect(
+                              Utils.toSortedMap(
+                                  Map.Entry::getKey,
+                                  entry -> {
+                                    int leaderBroker = entry.getValue();
+                                    return List.of(
+                                                   (leaderBroker + 2) % clusterSize,
+                                                   leaderBroker,
+                                                   (leaderBroker + 1) % clusterSize)
+                                               .subList(0, replicaSize);
+                                  }));
+      var expectedLeaderMap =
+          (Supplier<Map<TopicPartition, Integer>>)
+              () ->
+                  expectedReplicaList.entrySet().stream()
+                                     .collect(
+                                         Utils.toSortedMap(
+                                             Map.Entry::getKey,
+                                             e -> e.getValue().stream().findFirst().orElseThrow()));
+
+      // change replica list
+      topicPartitions.forEach(
+          topicPartition ->
+              Utils.packException(
+                  () ->
+                      admin
+                          .moveToBrokers(
+                              Map.of(
+                                  TopicPartition.of(
+                                      topicPartition.topic(), topicPartition.partition()),
+                                  expectedReplicaList.get(topicPartition)))
+                          .toCompletableFuture()
+                          .get()));
+      Utils.sleep(Duration.ofSeconds(8));
+
+      // ReplicaMigrator#moveTo will trigger leader election if current leader being kicked out of
+      // replica list. This case is always true for replica size equals to 1.
+      if (replicaSize == 1) {
+        // ReplicaMigrator#moveTo will trigger leader election implicitly if the original leader is
+        // kicked out of the replica list. Test if ReplicaMigrator#moveTo actually trigger leader
+        // election implicitly.
+        Assertions.assertEquals(expectedLeaderMap.get(), currentLeaderMap.get());
+
+        // act, the Admin#preferredLeaderElection won't throw a ElectionNotNeededException
+        topicPartitions.forEach(admin::preferredLeaderElection);
+        Utils.sleep(Duration.ofSeconds(2));
+      } else {
+        // before election
+        Assertions.assertNotEquals(expectedLeaderMap.get(), currentLeaderMap.get());
+
+        // act
+        topicPartitions.forEach(admin::preferredLeaderElection);
+        Utils.sleep(Duration.ofSeconds(2));
+
+        // after election
+        Assertions.assertEquals(expectedLeaderMap.get(), currentLeaderMap.get());
+      }
+    }
+  }
+
+  @Test
+  void testTransactionIds() throws ExecutionException, InterruptedException {
+    var topic = Utils.randomString();
+    try (var admin = AsyncAdmin.of(bootstrapServers());
+         var producer =
+             Producer.builder().bootstrapServers(bootstrapServers()).buildTransactional()) {
+      Assertions.assertTrue(producer.transactional());
+      producer.sender().key(new byte[10]).topic(topic).run().toCompletableFuture().get();
+
+      Assertions.assertTrue(
+          admin
+              .transactionIds()
+              .toCompletableFuture()
+              .get()
+              .contains(producer.transactionId().get()));
+
+      var transaction =
+          admin
+              .transactions(admin.transactionIds().toCompletableFuture().get())
+              .toCompletableFuture()
+              .get()
+              .stream()
+              .filter(t -> t.transactionId().equals(producer.transactionId().get()))
+              .findFirst()
+              .get();
+      Assertions.assertNotNull(transaction);
+      Assertions.assertEquals(
+          transaction.state() == TransactionState.COMPLETE_COMMIT ? 0 : 1,
+          transaction.topicPartitions().size());
+    }
+  }
+
+  @Test
+  void testTransactionIdsWithMultiPuts() throws ExecutionException, InterruptedException {
+    var topic = Utils.randomString();
+    try (var admin = AsyncAdmin.of(bootstrapServers());
+         var producer =
+             Producer.builder().bootstrapServers(bootstrapServers()).buildTransactional()) {
+      Assertions.assertTrue(producer.transactional());
+      IntStream.range(0, 10)
+               .forEach(
+                   index ->
+                       producer.sender().key(String.valueOf(index).getBytes(UTF_8)).topic(topic).run());
+      producer.flush();
+
+      Assertions.assertTrue(
+          admin
+              .transactionIds()
+              .toCompletableFuture()
+              .get()
+              .contains(producer.transactionId().get()));
+      Utils.waitFor(
+          () ->
+              Utils.packException(
+                  () ->
+                      admin
+                          .transactions(admin.transactionIds().toCompletableFuture().get())
+                          .toCompletableFuture()
+                          .get()
+                          .stream()
+                          .filter(t -> t.transactionId().equals(producer.transactionId().get()))
+                          .findFirst()
+                          .get()
+                          .state()
+                          == TransactionState.COMPLETE_COMMIT));
+      Utils.waitFor(
+          () ->
+              Utils.packException(
+                  () ->
+                      admin
+                          .transactions(admin.transactionIds().toCompletableFuture().get())
+                          .toCompletableFuture()
+                          .get()
+                          .stream()
+                          .filter(t -> t.transactionId().equals(producer.transactionId().get()))
+                          .findFirst()
+                          .get()
+                          .topicPartitions()
+                          .isEmpty()));
     }
   }
 }
