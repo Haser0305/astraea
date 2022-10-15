@@ -27,7 +27,9 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -42,6 +44,7 @@ import org.astraea.common.producer.Producer;
 import org.astraea.common.producer.Serializer;
 import org.astraea.it.RequireBrokerCluster;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -543,7 +546,7 @@ public class AsyncAdminTest extends RequireBrokerCluster {
   @Test
   void testIllegalMigrationArgument() throws ExecutionException, InterruptedException {
     var topic = Utils.randomString();
-    var topicParition = TopicPartition.of(topic, 0);
+    var topicPartition = TopicPartition.of(topic, 0);
     try (var admin = AsyncAdmin.of(bootstrapServers())) {
       admin
           .creator()
@@ -556,7 +559,7 @@ public class AsyncAdminTest extends RequireBrokerCluster {
       Utils.sleep(Duration.ofSeconds(1));
       var currentReplica =
           admin.replicas(Set.of(topic)).toCompletableFuture().get().stream()
-              .filter(replica -> replica.partition() == topicParition.partition())
+              .filter(replica -> replica.partition() == topicPartition.partition())
               .findFirst()
               .get();
 
@@ -857,18 +860,18 @@ public class AsyncAdminTest extends RequireBrokerCluster {
 
     try (var admin = AsyncAdmin.of(bootstrapServers())) {
       Stream.of(topic0, topic1, topic2)
-            .forEach(
-                topic ->
-                    Utils.packException(
-                        () ->
-                            admin
-                                .creator()
-                                .topic(topic)
-                                .numberOfPartitions(partitionCount)
-                                .numberOfReplicas(replicaCount)
-                                .run()
-                                .toCompletableFuture()
-                                .get()));
+          .forEach(
+              topic ->
+                  Utils.packException(
+                      () ->
+                          admin
+                              .creator()
+                              .topic(topic)
+                              .numberOfPartitions(partitionCount)
+                              .numberOfReplicas(replicaCount)
+                              .run()
+                              .toCompletableFuture()
+                              .get()));
 
       Utils.sleep(Duration.ofSeconds(2));
 
@@ -939,8 +942,8 @@ public class AsyncAdminTest extends RequireBrokerCluster {
 
       var topicPartitions =
           IntStream.range(0, 30)
-                   .mapToObj(i -> TopicPartition.of(topic, i))
-                   .collect(Collectors.toUnmodifiableSet());
+              .mapToObj(i -> TopicPartition.of(topic, i))
+              .collect(Collectors.toUnmodifiableSet());
 
       var currentLeaderMap =
           (Supplier<Map<TopicPartition, Integer>>)
@@ -948,34 +951,34 @@ public class AsyncAdminTest extends RequireBrokerCluster {
                   Utils.packException(
                       () ->
                           admin.replicas(Set.of(topic)).toCompletableFuture().get().stream()
-                               .filter(Replica::isLeader)
-                               .collect(
-                                   Utils.toSortedMap(
-                                       replica ->
-                                           TopicPartition.of(replica.topic(), replica.partition()),
-                                       replica -> replica.nodeInfo().id())));
+                              .filter(Replica::isLeader)
+                              .collect(
+                                  Utils.toSortedMap(
+                                      replica ->
+                                          TopicPartition.of(replica.topic(), replica.partition()),
+                                      replica -> replica.nodeInfo().id())));
 
       var expectedReplicaList =
           currentLeaderMap.get().entrySet().stream()
-                          .collect(
-                              Utils.toSortedMap(
-                                  Map.Entry::getKey,
-                                  entry -> {
-                                    int leaderBroker = entry.getValue();
-                                    return List.of(
-                                                   (leaderBroker + 2) % clusterSize,
-                                                   leaderBroker,
-                                                   (leaderBroker + 1) % clusterSize)
-                                               .subList(0, replicaSize);
-                                  }));
+              .collect(
+                  Utils.toSortedMap(
+                      Map.Entry::getKey,
+                      entry -> {
+                        int leaderBroker = entry.getValue();
+                        return List.of(
+                                (leaderBroker + 2) % clusterSize,
+                                leaderBroker,
+                                (leaderBroker + 1) % clusterSize)
+                            .subList(0, replicaSize);
+                      }));
       var expectedLeaderMap =
           (Supplier<Map<TopicPartition, Integer>>)
               () ->
                   expectedReplicaList.entrySet().stream()
-                                     .collect(
-                                         Utils.toSortedMap(
-                                             Map.Entry::getKey,
-                                             e -> e.getValue().stream().findFirst().orElseThrow()));
+                      .collect(
+                          Utils.toSortedMap(
+                              Map.Entry::getKey,
+                              e -> e.getValue().stream().findFirst().orElseThrow()));
 
       // change replica list
       topicPartitions.forEach(
@@ -1021,8 +1024,8 @@ public class AsyncAdminTest extends RequireBrokerCluster {
   void testTransactionIds() throws ExecutionException, InterruptedException {
     var topic = Utils.randomString();
     try (var admin = AsyncAdmin.of(bootstrapServers());
-         var producer =
-             Producer.builder().bootstrapServers(bootstrapServers()).buildTransactional()) {
+        var producer =
+            Producer.builder().bootstrapServers(bootstrapServers()).buildTransactional()) {
       Assertions.assertTrue(producer.transactional());
       producer.sender().key(new byte[10]).topic(topic).run().toCompletableFuture().get();
 
@@ -1053,13 +1056,13 @@ public class AsyncAdminTest extends RequireBrokerCluster {
   void testTransactionIdsWithMultiPuts() throws ExecutionException, InterruptedException {
     var topic = Utils.randomString();
     try (var admin = AsyncAdmin.of(bootstrapServers());
-         var producer =
-             Producer.builder().bootstrapServers(bootstrapServers()).buildTransactional()) {
+        var producer =
+            Producer.builder().bootstrapServers(bootstrapServers()).buildTransactional()) {
       Assertions.assertTrue(producer.transactional());
       IntStream.range(0, 10)
-               .forEach(
-                   index ->
-                       producer.sender().key(String.valueOf(index).getBytes(UTF_8)).topic(topic).run());
+          .forEach(
+              index ->
+                  producer.sender().key(String.valueOf(index).getBytes(UTF_8)).topic(topic).run());
       producer.flush();
 
       Assertions.assertTrue(
@@ -1073,14 +1076,14 @@ public class AsyncAdminTest extends RequireBrokerCluster {
               Utils.packException(
                   () ->
                       admin
-                          .transactions(admin.transactionIds().toCompletableFuture().get())
-                          .toCompletableFuture()
-                          .get()
-                          .stream()
-                          .filter(t -> t.transactionId().equals(producer.transactionId().get()))
-                          .findFirst()
-                          .get()
-                          .state()
+                              .transactions(admin.transactionIds().toCompletableFuture().get())
+                              .toCompletableFuture()
+                              .get()
+                              .stream()
+                              .filter(t -> t.transactionId().equals(producer.transactionId().get()))
+                              .findFirst()
+                              .get()
+                              .state()
                           == TransactionState.COMPLETE_COMMIT));
       Utils.waitFor(
           () ->
@@ -1096,6 +1099,166 @@ public class AsyncAdminTest extends RequireBrokerCluster {
                           .get()
                           .topicPartitions()
                           .isEmpty()));
+    }
+  }
+
+  @RepeatedTest(5) // this test is timer-based, so it needs to be looped for stability
+  void testReassignmentWhenMovingPartitionToAnotherBroker()
+      throws ExecutionException, InterruptedException {
+    var topic = Utils.randomString();
+    try (var admin = AsyncAdmin.of(bootstrapServers())) {
+      admin.creator().topic(topic).numberOfPartitions(1).run().toCompletableFuture().get();
+      Utils.sleep(Duration.ofSeconds(3));
+
+      var currentBroker =
+          admin.replicas(Set.of(topic)).toCompletableFuture().get().stream()
+              .filter(replica -> replica.partition() == 0)
+              .findFirst()
+              .get()
+              .nodeInfo()
+              .id();
+      var nextBroker = brokerIds().stream().filter(i -> i != currentBroker).findFirst().get();
+
+      try (var producer = Producer.of(bootstrapServers())) {
+        var done = new AtomicBoolean(false);
+        var date = new byte[1000];
+        var f =
+            CompletableFuture.runAsync(
+                () -> {
+                  while (!done.get()) producer.sender().topic(topic).key(date).value(date).run();
+                });
+        try {
+          admin
+              .partitions(Set.of(topic))
+              .toCompletableFuture()
+              .get()
+              .forEach(
+                  p ->
+                      admin.moveToBrokers(
+                          Map.of(TopicPartition.of(topic, p.partition()), List.of(nextBroker))));
+          var addingReplicas = admin.addingReplicas(Set.of(topic)).toCompletableFuture().get();
+
+          if (!addingReplicas.isEmpty()) {
+            Assertions.assertEquals(1, addingReplicas.size());
+            Assertions.assertEquals(nextBroker, addingReplicas.get(0).broker());
+          }
+
+        } finally {
+          done.set(true);
+          Utils.swallowException(f::get);
+        }
+      }
+    }
+  }
+
+  @RepeatedTest(5)
+  void testReassignmentWhenMovingPartitionToAnotherPath()
+      throws ExecutionException, InterruptedException {
+    var topic = Utils.randomString();
+    try (var admin = AsyncAdmin.of(bootstrapServers())) {
+      admin.creator().topic(topic).numberOfPartitions(1).run().toCompletableFuture().get();
+      Utils.sleep(Duration.ofSeconds(3));
+
+      var currentReplica =
+          admin.replicas(Set.of(topic)).toCompletableFuture().get().stream()
+              .filter(replica -> replica.partition() == 0)
+              .findFirst()
+              .get();
+      var currentBroker = currentReplica.nodeInfo().id();
+      var currentPath = currentReplica.dataFolder();
+      var nextPath =
+          logFolders().get(currentBroker).stream()
+              .filter(p -> !p.equals(currentPath))
+              .findFirst()
+              .get();
+
+      try (var producer = Producer.of(bootstrapServers())) {
+        var done = new AtomicBoolean(false);
+        var data = new byte[1000];
+        var f =
+            CompletableFuture.runAsync(
+                () -> {
+                  while (!done.get()) producer.sender().topic(topic).key(data).value(data).run();
+                });
+
+        try {
+          admin.moveToFolders(
+              Map.of(
+                  TopicPartitionReplica.of(topic, currentReplica.partition(), currentBroker),
+                  nextPath));
+          var addingReplicas = admin.addingReplicas(Set.of(topic)).toCompletableFuture().get();
+
+          if (!addingReplicas.isEmpty()) {
+            Assertions.assertEquals(1, addingReplicas.size());
+            Assertions.assertEquals(currentBroker, addingReplicas.get(0).broker());
+            Assertions.assertEquals(nextPath, addingReplicas.get(0).path());
+          }
+        } finally {
+          done.set(true);
+          Utils.swallowException(f::get);
+        }
+      }
+    }
+  }
+
+  @RepeatedTest(5) // this test is timer-based, so it needs to be looped for stability
+  void testMultiReassignments() throws ExecutionException, InterruptedException {
+    var topic = Utils.randomString(10);
+    try (var admin = AsyncAdmin.of(bootstrapServers())) {
+      admin
+          .creator()
+          .topic(topic)
+          .numberOfPartitions(1)
+          .numberOfReplicas((short) 3)
+          .run()
+          .toCompletableFuture()
+          .get();
+      Utils.sleep(Duration.ofSeconds(3));
+
+      var brokers = new ArrayList<>(brokerIds()).subList(0, 2);
+      try (var producer = Producer.of(bootstrapServers())) {
+        var done = new AtomicBoolean(false);
+        var data = new byte[1000];
+        var f =
+            CompletableFuture.runAsync(
+                () -> {
+                  while (!done.get()) producer.sender().topic(topic).key(data).value(data).run();
+                });
+        try {
+          admin
+              .moveToBrokers(Map.of(TopicPartition.of(topic, 0), brokers))
+              .toCompletableFuture()
+              .get();
+          var addingReplicas = admin.addingReplicas(Set.of(topic)).toCompletableFuture().get();
+
+          if (!addingReplicas.isEmpty()) Assertions.assertEquals(2, addingReplicas.size());
+        } finally {
+          done.set(true);
+          Utils.swallowException(f::get);
+        }
+      }
+    }
+  }
+
+  @Test
+  void testReassignmentWithNothing() throws ExecutionException, InterruptedException {
+    var topic = Utils.randomString(10);
+    try (var admin = AsyncAdmin.of(bootstrapServers())) {
+      admin
+          .creator()
+          .topic(topic)
+          .numberOfPartitions(1)
+          .numberOfReplicas((short) 3)
+          .run()
+          .toCompletableFuture()
+          .get();
+      Utils.sleep(Duration.ofSeconds(3));
+      try (var producer = Producer.of(bootstrapServers())) {
+        producer.sender().topic(topic).value(new byte[100]).run();
+        producer.flush();
+      }
+      Assertions.assertEquals(
+          0, admin.addingReplicas(Set.of(topic)).toCompletableFuture().get().size());
     }
   }
 }
